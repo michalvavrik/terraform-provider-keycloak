@@ -697,3 +697,20 @@ func NewSignedJWT(ctx context.Context, url, clientId, alg, jwtSigningKey string)
 func (kc *KeycloakClient) GetHttpClient() *http.Client {
 	return kc.httpClient
 }
+
+// Public wrappers for admin-v2 API integration (used by provider package)
+func (kc *KeycloakClient) Post(ctx context.Context, path string, body interface{}) ([]byte, string, error) {
+	return kc.post(ctx, path, body)
+}
+
+func (kc *KeycloakClient) Get(ctx context.Context, path string, resource interface{}, params map[string]string) error {
+	return kc.get(ctx, path, resource, params)
+}
+
+func (kc *KeycloakClient) Put(ctx context.Context, path string, body interface{}) error {
+	return kc.put(ctx, path, body)
+}
+
+func (kc *KeycloakClient) Delete(ctx context.Context, path string, body interface{}) error {
+	return kc.delete(ctx, path, body)
+}

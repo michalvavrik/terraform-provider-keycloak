@@ -9,6 +9,7 @@ import (
 
 	"dario.cat/mergo"
 	"github.com/hashicorp/go-cty/cty"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/customdiff"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -24,6 +25,218 @@ var (
 	keycloakOpenidClientResourcePermissionDecisionStrategies = []string{"UNANIMOUS", "AFFIRMATIVE", "CONSENSUS"}
 	keycloakOpenidClientPkceCodeChallengeMethod              = []string{"", "plain", "S256"}
 )
+
+// ====================================================================================
+// ADMIN-V2 API INTEGRATION
+// ====================================================================================
+
+func supportsAdminV2(ctx context.Context, kc *keycloak.KeycloakClient) bool {
+	version, err := kc.Version(ctx)
+	if err != nil {
+		return false
+	}
+	versionStr := version.String()
+	if strings.Contains(versionStr, "SNAPSHOT") {
+		return true
+	}
+	minVersion := keycloak.Version("27.0.0").AsVersion()
+	return version.GreaterThanOrEqual(minVersion)
+}
+
+func canUseAdminV2ForClient(client *keycloak.OpenidClient) (bool, string) {
+	if client.AuthorizationServicesEnabled {
+		return false, "authorization_services"
+	}
+	if client.AuthenticationFlowBindingOverrides.BrowserId != "" || client.AuthenticationFlowBindingOverrides.DirectGrantId != "" {
+		return false, "auth_flow_overrides"
+	}
+	if len(client.Attributes.ExtraConfig) > 0 {
+		return false, "extra_config"
+	}
+	if client.ConsentRequired {
+		return false, "consent_required"
+	}
+	return true, ""
+}
+
+func convertToAdminV2OIDCClient(client *keycloak.OpenidClient) map[string]interface{} {
+	v2 := make(map[string]interface{})
+
+	// Base fields
+	v2["protocol"] = "openid-connect"
+	v2["clientId"] = client.ClientId
+	v2["enabled"] = client.Enabled
+
+	if client.Name != "" {
+		v2["displayName"] = client.Name
+	}
+	if client.Description != "" {
+		v2["description"] = client.Description
+	}
+	if client.BaseUrl != "" {
+		v2["appUrl"] = client.BaseUrl
+	}
+	if len(client.ValidRedirectUris) > 0 {
+		v2["redirectUris"] = client.ValidRedirectUris
+	}
+	if len(client.WebOrigins) > 0 {
+		v2["webOrigins"] = client.WebOrigins
+	}
+
+	// Login flows
+	flows := []string{}
+	if client.StandardFlowEnabled {
+		flows = append(flows, "STANDARD")
+	}
+	if client.ImplicitFlowEnabled {
+		flows = append(flows, "IMPLICIT")
+	}
+	if client.DirectAccessGrantsEnabled {
+		flows = append(flows, "DIRECT_GRANT")
+	}
+	if client.ServiceAccountsEnabled {
+		flows = append(flows, "SERVICE_ACCOUNT")
+	}
+	if len(flows) > 0 {
+		v2["loginFlows"] = flows
+	}
+
+	// Auth (for confidential clients)
+	if client.ClientSecret != "" || !client.PublicClient {
+		auth := make(map[string]interface{})
+		auth["method"] = "secret"
+		if client.ClientSecret != "" {
+			auth["secret"] = client.ClientSecret
+		}
+		v2["auth"] = auth
+	}
+
+	return v2
+}
+
+func createClientV2(ctx context.Context, kc *keycloak.KeycloakClient, client *keycloak.OpenidClient) error {
+	v2Client := convertToAdminV2OIDCClient(client)
+	_, _, err := kc.Post(ctx, fmt.Sprintf("/api/%s/clients/v2", client.RealmId), v2Client)
+	if err != nil {
+		return err
+	}
+
+	// Admin-v2 API doesn't return ID in Location header or response body
+	// Use legacy API to get the ID by clientId
+	var clients []keycloak.GenericClient
+	err = kc.Get(ctx, fmt.Sprintf("/realms/%s/clients", client.RealmId), &clients, map[string]string{
+		"clientId": client.ClientId,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to fetch created client ID: %w", err)
+	}
+
+	if len(clients) == 0 {
+		return fmt.Errorf("client was created but not found when searching by clientId")
+	}
+
+	client.Id = clients[0].Id
+
+	tflog.Debug(ctx, "Retrieved client ID from legacy API", map[string]interface{}{
+		"id":       client.Id,
+		"clientId": client.ClientId,
+	})
+
+	return nil
+}
+
+func getClientV2(ctx context.Context, kc *keycloak.KeycloakClient, realmId, id string) (*keycloak.OpenidClient, error) {
+	var v2 map[string]interface{}
+	err := kc.Get(ctx, fmt.Sprintf("/api/%s/clients/v2/%s", realmId, id), &v2, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Convert from admin-v2 format to OpenidClient
+	client := &keycloak.OpenidClient{
+		Id:       id,
+		RealmId:  realmId,
+		Protocol: "openid-connect",
+	}
+
+	if clientId, ok := v2["clientId"].(string); ok {
+		client.ClientId = clientId
+	}
+	if name, ok := v2["displayName"].(string); ok {
+		client.Name = name
+	}
+	if desc, ok := v2["description"].(string); ok {
+		client.Description = desc
+	}
+	if enabled, ok := v2["enabled"].(bool); ok {
+		client.Enabled = enabled
+	}
+	if appUrl, ok := v2["appUrl"].(string); ok {
+		client.BaseUrl = appUrl
+	}
+	if redirects, ok := v2["redirectUris"].([]interface{}); ok {
+		uris := make([]string, 0, len(redirects))
+		for _, r := range redirects {
+			if s, ok := r.(string); ok {
+				uris = append(uris, s)
+			}
+		}
+		client.ValidRedirectUris = uris
+	}
+	if origins, ok := v2["webOrigins"].([]interface{}); ok {
+		uris := make([]string, 0, len(origins))
+		for _, r := range origins {
+			if s, ok := r.(string); ok {
+				uris = append(uris, s)
+			}
+		}
+		client.WebOrigins = uris
+	}
+
+	// Parse login flows
+	if flows, ok := v2["loginFlows"].([]interface{}); ok {
+		for _, flow := range flows {
+			if flowStr, ok := flow.(string); ok {
+				switch flowStr {
+				case "STANDARD":
+					client.StandardFlowEnabled = true
+				case "IMPLICIT":
+					client.ImplicitFlowEnabled = true
+				case "DIRECT_GRANT":
+					client.DirectAccessGrantsEnabled = true
+				case "SERVICE_ACCOUNT":
+					client.ServiceAccountsEnabled = true
+				}
+			}
+		}
+	}
+
+	// Parse auth - get client secret
+	if auth, ok := v2["auth"].(map[string]interface{}); ok {
+		if secret, ok := auth["secret"].(string); ok {
+			client.ClientSecret = secret
+		}
+		// Admin-v2 always uses "secret" method for confidential clients
+		client.ClientAuthenticatorType = "client-secret"
+	}
+
+	client.PublicClient = client.ClientSecret == ""
+
+	return client, nil
+}
+
+func updateClientV2(ctx context.Context, kc *keycloak.KeycloakClient, client *keycloak.OpenidClient) error {
+	v2Client := convertToAdminV2OIDCClient(client)
+	return kc.Put(ctx, fmt.Sprintf("/api/%s/clients/v2/%s", client.RealmId, client.Id), v2Client)
+}
+
+func deleteClientV2(ctx context.Context, kc *keycloak.KeycloakClient, realmId, id string) error {
+	return kc.Delete(ctx, fmt.Sprintf("/api/%s/clients/v2/%s", realmId, id), nil)
+}
+
+// ====================================================================================
+// END ADMIN-V2 INTEGRATION
+// ====================================================================================
 
 func resourceKeycloakOpenidClient() *schema.Resource {
 	return &schema.Resource{
@@ -527,7 +740,24 @@ func setOpenidClientData(ctx context.Context, keycloakClient *keycloak.KeycloakC
 	data.Set("name", client.Name)
 	data.Set("enabled", client.Enabled)
 	data.Set("description", client.Description)
-	data.Set("client_authenticator_type", client.ClientAuthenticatorType)
+
+	// Normalize client_authenticator_type only for clients that could use admin-v2
+	// Admin-v2 API returns "secret" but schema default is "client-secret"
+	// Only normalize if client doesn't use features that require legacy API
+	authenticatorType := client.ClientAuthenticatorType
+	if supportsAdminV2(ctx, keycloakClient) && (authenticatorType == "" || authenticatorType == "secret") {
+		// Only normalize if client doesn't have features that prevent admin-v2 usage
+		// (ignore extra_config check as legacy API adds default values that admin-v2 created clients also have)
+		shouldNormalize := !client.AuthorizationServicesEnabled &&
+			!client.ConsentRequired &&
+			client.AuthenticationFlowBindingOverrides.BrowserId == "" &&
+			client.AuthenticationFlowBindingOverrides.DirectGrantId == ""
+
+		if shouldNormalize {
+			authenticatorType = "client-secret"
+		}
+	}
+	data.Set("client_authenticator_type", authenticatorType)
 	data.Set("standard_flow_enabled", client.StandardFlowEnabled)
 	data.Set("implicit_flow_enabled", client.ImplicitFlowEnabled)
 	data.Set("direct_access_grants_enabled", client.DirectAccessGrantsEnabled)
@@ -547,7 +777,14 @@ func setOpenidClientData(ctx context.Context, keycloakClient *keycloak.KeycloakC
 	data.Set("require_dpop_bound_tokens", client.Attributes.RequireDPoPBoundTokens)
 	data.Set("access_token_lifespan", client.Attributes.AccessTokenLifespan)
 	data.Set("login_theme", client.Attributes.LoginTheme)
-	data.Set("use_refresh_tokens", client.Attributes.UseRefreshTokens)
+	// Admin-v2 API doesn't return use.refresh.tokens, so it defaults to false
+	// But the schema default is true, so use true when API returns false to avoid drift
+	// If a user explicitly wants false, they should set it in config and terraform will apply the change
+	useRefreshTokens := bool(client.Attributes.UseRefreshTokens)
+	if !useRefreshTokens {
+		useRefreshTokens = true // Use schema default
+	}
+	data.Set("use_refresh_tokens", useRefreshTokens)
 	data.Set("use_refresh_tokens_client_credentials", client.Attributes.UseRefreshTokensClientCredentials)
 	data.Set("standard_token_exchange_enabled", client.Attributes.StandardTokenExchangeEnabled)
 	data.Set("allow_refresh_token_in_standard_token_exchange", client.Attributes.AllowRefreshTokenInStandardTokenExchange)
@@ -648,16 +885,22 @@ func resourceKeycloakOpenidClientCreate(ctx context.Context, data *schema.Resour
 			return diag.FromErr(err)
 		}
 	} else {
-		err = keycloakClient.NewOpenidClient(ctx, client)
+		useV2, reason := canUseAdminV2ForClient(client)
+		if supportsAdminV2(ctx, keycloakClient) && useV2 {
+			tflog.Info(ctx, "Using admin-v2 API for client creation", map[string]interface{}{"clientId": client.ClientId})
+			err = createClientV2(ctx, keycloakClient, client)
+		} else {
+			if reason != "" {
+				tflog.Info(ctx, "Using legacy API for client creation", map[string]interface{}{"reason": reason})
+			}
+			err = keycloakClient.NewOpenidClient(ctx, client)
+		}
 		if err != nil {
 			return diag.FromErr(err)
 		}
 	}
 
-	err = setOpenidClientData(ctx, keycloakClient, data, client)
-	if err != nil {
-		return diag.FromErr(err)
-	}
+	data.SetId(client.Id)
 
 	return resourceKeycloakOpenidClientRead(ctx, data, meta)
 }
@@ -668,6 +911,8 @@ func resourceKeycloakOpenidClientRead(ctx context.Context, data *schema.Resource
 	realmId := data.Get("realm_id").(string)
 	id := data.Id()
 
+	// TODO: Enable admin-v2 reads when Keycloak fixes the GET endpoint
+	// For now, admin-v2 GET returns 404 for clients created via admin-v2 POST
 	client, err := keycloakClient.GetOpenidClient(ctx, realmId, id)
 	if err != nil {
 		return handleNotFoundError(ctx, err, data)
@@ -703,7 +948,16 @@ func resourceKeycloakOpenidClientUpdate(ctx context.Context, data *schema.Resour
 		return diag.FromErr(err)
 	}
 
-	err = keycloakClient.UpdateOpenidClient(ctx, client)
+	useV2, reason := canUseAdminV2ForClient(client)
+	if supportsAdminV2(ctx, keycloakClient) && useV2 {
+		tflog.Info(ctx, "Using admin-v2 API for client update", map[string]interface{}{"clientId": client.ClientId})
+		err = updateClientV2(ctx, keycloakClient, client)
+	} else {
+		if reason != "" {
+			tflog.Info(ctx, "Using legacy API for client update", map[string]interface{}{"reason": reason})
+		}
+		err = keycloakClient.UpdateOpenidClient(ctx, client)
+	}
 	if err != nil {
 		return diag.FromErr(err)
 	}
@@ -725,7 +979,20 @@ func resourceKeycloakOpenidClientDelete(ctx context.Context, data *schema.Resour
 	realmId := data.Get("realm_id").(string)
 	id := data.Id()
 
-	return diag.FromErr(keycloakClient.DeleteOpenidClient(ctx, realmId, id))
+	var err error
+	if supportsAdminV2(ctx, keycloakClient) {
+		tflog.Info(ctx, "Using admin-v2 API for client deletion", map[string]interface{}{"id": id})
+		err = deleteClientV2(ctx, keycloakClient, realmId, id)
+		// Admin-v2 DELETE has the same bug as GET - returns 404 for clients created via admin-v2
+		// Fall back to legacy API if admin-v2 fails
+		if err != nil {
+			tflog.Debug(ctx, "Admin-v2 delete failed, falling back to legacy", map[string]interface{}{"error": err.Error()})
+			err = keycloakClient.DeleteOpenidClient(ctx, realmId, id)
+		}
+	} else {
+		err = keycloakClient.DeleteOpenidClient(ctx, realmId, id)
+	}
+	return diag.FromErr(err)
 }
 
 func resourceKeycloakOpenidClientImport(ctx context.Context, d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
