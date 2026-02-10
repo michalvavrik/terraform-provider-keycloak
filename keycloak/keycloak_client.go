@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-uuid"
@@ -26,6 +28,9 @@ import (
 	"golang.org/x/net/publicsuffix"
 
 	"github.com/hashicorp/go-retryablehttp"
+	"github.com/keycloak/terraform-provider-keycloak/internal/keycloak/adminv2"
+	abstractions "github.com/microsoft/kiota-abstractions-go"
+	kiotahttp "github.com/microsoft/kiota-http-go"
 )
 
 type KeycloakClient struct {
@@ -42,6 +47,9 @@ type KeycloakClient struct {
 	redHatSSO           bool
 	accessTokenProvided bool
 	Mutex               *mutex.KeyValue
+	adminV2Client       *adminv2.KeycloakAdminV2Client
+	adminV2Once         sync.Once
+	adminV2BaseUrl      string
 }
 
 type ClientCredentials struct {
@@ -134,6 +142,9 @@ func NewKeycloakClient(ctx context.Context, url, basePath, adminUrl, clientId, c
 	if tfLog, ok := os.LookupEnv("TF_LOG"); ok && tfLog == "DEBUG" {
 		keycloakClient.debug = true
 	}
+
+	// Kiota-generated paths already include /admin, so use URL without /admin suffix
+	keycloakClient.adminV2BaseUrl = url + basePath
 
 	return &keycloakClient, nil
 }
@@ -696,4 +707,50 @@ func NewSignedJWT(ctx context.Context, url, clientId, alg, jwtSigningKey string)
 // Expose the underlying http client for tests
 func (kc *KeycloakClient) GetHttpClient() *http.Client {
 	return kc.httpClient
+}
+
+// === admin-v2 API
+func (kc *KeycloakClient) Get(ctx context.Context, path string, resource interface{}, params map[string]string) error {
+	return kc.get(ctx, path, resource, params)
+}
+
+func (kc *KeycloakClient) GetAdminV2Client() *adminv2.KeycloakAdminV2Client {
+	kc.adminV2Once.Do(func() {
+		adapter, err := kiotahttp.NewNetHttpRequestAdapter(&keycloakAuthProvider{client: kc})
+		if err != nil {
+			if kc.debug {
+				log.Printf("[WARN] Failed to create Kiota adapter: %v", err)
+			}
+			return
+		}
+		adapter.SetBaseUrl(kc.adminV2BaseUrl)
+		kc.adminV2Client = adminv2.NewKeycloakAdminV2Client(adapter)
+	})
+	return kc.adminV2Client
+}
+
+type keycloakAuthProvider struct {
+	client *KeycloakClient
+}
+
+func (p *keycloakAuthProvider) AuthenticateRequest(ctx context.Context, request *abstractions.RequestInformation, additionalAuthenticationContext map[string]interface{}) error {
+	if p.client.clientCredentials.AccessToken == "" && !p.client.accessTokenProvided {
+		if err := p.client.login(ctx); err != nil {
+			return fmt.Errorf("failed to login for authentication: %w", err)
+		}
+	}
+
+	if p.client.clientCredentials.AccessToken != "" {
+		request.Headers.Add("Authorization", fmt.Sprintf("Bearer %s", p.client.clientCredentials.AccessToken))
+	}
+
+	if p.client.userAgent != "" {
+		request.Headers.Add("User-Agent", p.client.userAgent)
+	}
+
+	for header, value := range p.client.additionalHeaders {
+		request.Headers.Add(header, value)
+	}
+
+	return nil
 }
