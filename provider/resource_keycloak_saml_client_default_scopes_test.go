@@ -207,6 +207,24 @@ func TestAccKeycloakSamlClientDefaultScopes_authoritativeRemove(t *testing.T) {
 	})
 }
 
+// Issue #1395: when default_scopes references a scope that does not exist in the realm,
+// the provider should return an error instead of silently ignoring it (which causes permanent drift).
+func TestAccKeycloakSamlClientDefaultScopes_validateScopeDoesNotExist(t *testing.T) {
+	t.Parallel()
+	client := acctest.RandomWithPrefix("tf-acc")
+
+	resource.Test(t, resource.TestCase{
+		ProviderFactories: testAccProviderFactories,
+		PreCheck:          func() { testAccPreCheck(t) },
+		Steps: []resource.TestStep{
+			{
+				Config:      testKeycloakSamlClientDefaultScopes_listOfScopes(client, acctest.RandomWithPrefix("tf-acc"), []string{"role_list", "non_existent_scope_that_should_fail"}),
+				ExpectError: regexp.MustCompile("scope .+ does not exist"),
+			},
+		},
+	})
+}
+
 // this resource doesn't support import because it can be created even if the desired state already exists in keycloak
 func TestAccKeycloakSamlClientDefaultScopes_noImportNeeded(t *testing.T) {
 	t.Parallel()
