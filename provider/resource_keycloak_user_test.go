@@ -324,6 +324,34 @@ func TestAccKeycloakUser_import(t *testing.T) {
 	})
 }
 
+func TestAccKeycloakUser_multiValuedAttributeNoDrift(t *testing.T) {
+	username := acctest.RandomWithPrefix("tf-acc")
+	attributeName := acctest.RandomWithPrefix("tf-acc-tenant-roles")
+
+	attributeValue := "role-1##role-2##role-3##role-4##role-5##role-6##role-7##role-8##role-9##role-10"
+	resourceName := "keycloak_user.user"
+
+	resource.Test(t, resource.TestCase{
+		ProviderFactories: testAccProviderFactories,
+		PreCheck:          func() { testAccPreCheck(t) },
+		CheckDestroy:      testAccCheckKeycloakUserDestroy(),
+		Steps: []resource.TestStep{
+			{
+				Config: testKeycloakUser_basic(username, attributeName, attributeValue),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckKeycloakUserExists(resourceName),
+					resource.TestCheckResourceAttr(resourceName, "attributes."+attributeName, attributeValue),
+				),
+			},
+			{
+				Config:             testKeycloakUser_basic(username, attributeName, attributeValue),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: false,
+			},
+		},
+	})
+}
+
 func testAccCheckKeycloakUserNotDestroyed() resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		for _, rs := range s.RootModule().Resources {
