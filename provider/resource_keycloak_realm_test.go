@@ -1012,6 +1012,30 @@ func TestAccKeycloakRealm_admin_permissions_enabled(t *testing.T) {
 	})
 }
 
+func TestAccKeycloakRealm_admin_permissions_disabled(t *testing.T) {
+	if ok, _ := keycloakClient.VersionIsGreaterThanOrEqualTo(testCtx, keycloak.Version_26_2); !ok {
+		t.Skip()
+	}
+
+	realmName := acctest.RandomWithPrefix("tf-acc")
+
+	resource.Test(t, resource.TestCase{
+		ProviderFactories: testAccProviderFactories,
+		PreCheck:          func() { testAccPreCheck(t) },
+		CheckDestroy:      testAccCheckKeycloakRealmDestroy(),
+		Steps: []resource.TestStep{
+			{
+				Config: testKeycloakRealm_admin_permission_enabled(realmName),
+				Check:  testAccCheckKeycloakRealm_admin_permissions_enabled("keycloak_realm.realm"),
+			},
+			{
+				Config: testKeycloakRealm_admin_permission_disabled(realmName),
+				Check:  testAccCheckKeycloakRealm_admin_permissions_disabled("keycloak_realm.realm"),
+			},
+		},
+	})
+}
+
 func testKeycloakRealm_admin_permission_enabled(realm string) string {
 
 	return fmt.Sprintf(`
@@ -1021,6 +1045,32 @@ resource "keycloak_realm" "realm" {
 	admin_permissions_enabled      = true
 }
 	`, realm)
+}
+
+func testKeycloakRealm_admin_permission_disabled(realm string) string {
+
+	return fmt.Sprintf(`
+resource "keycloak_realm" "realm" {
+	realm                          = "%s"
+	enabled                        = true
+	admin_permissions_enabled      = false
+}
+	`, realm)
+}
+
+func testAccCheckKeycloakRealm_admin_permissions_disabled(resourceName string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		realm, err := getRealmFromState(s, resourceName)
+		if err != nil {
+			return err
+		}
+
+		if realm.AdminPermissionsEnabled {
+			return fmt.Errorf("expected realm %s to have admin permissions disabled but was %t", realm.Realm, realm.AdminPermissionsEnabled)
+		}
+
+		return nil
+	}
 }
 
 func testAccCheckKeycloakRealm_admin_permissions_enabled(resourceName string) resource.TestCheckFunc {
