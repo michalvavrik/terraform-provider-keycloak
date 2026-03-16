@@ -12,6 +12,8 @@ import (
 )
 
 func TestAccKeycloakIdpTokenExchangeScopePermission_basic(t *testing.T) {
+	// only supported with admin-fine-grained-authz:v1, not v2
+	skipIfVersionIsGreaterThanOrEqualTo(testCtx, t, keycloakClient, keycloak.Version_26_5)
 	t.Parallel()
 
 	providerAlias := acctest.RandomWithPrefix("tf-acc")
@@ -32,6 +34,7 @@ func TestAccKeycloakIdpTokenExchangeScopePermission_basic(t *testing.T) {
 }
 
 func TestAccKeycloakIdpTokenExchangeScopePermission_createAfterManualDestroy(t *testing.T) {
+	skipIfVersionIsGreaterThanOrEqualTo(testCtx, t, keycloakClient, keycloak.Version_26_5)
 	t.Parallel()
 
 	var idpPermissions = &keycloak.IdentityProviderPermissions{}
@@ -67,6 +70,7 @@ func TestAccKeycloakIdpTokenExchangeScopePermission_createAfterManualDestroy(t *
 }
 
 func TestAccKeycloakIdpTokenExchangeScopePermission_import(t *testing.T) {
+	skipIfVersionIsGreaterThanOrEqualTo(testCtx, t, keycloakClient, keycloak.Version_26_5)
 	t.Parallel()
 
 	providerAlias := acctest.RandomWithPrefix("tf-acc")
@@ -93,6 +97,7 @@ func TestAccKeycloakIdpTokenExchangeScopePermission_import(t *testing.T) {
 }
 
 func TestAccKeycloakIdpTokenExchangeScopePermission_updatePolicyMultipleClients(t *testing.T) {
+	skipIfVersionIsGreaterThanOrEqualTo(testCtx, t, keycloakClient, keycloak.Version_26_5)
 	t.Parallel()
 
 	providerAlias := acctest.RandomWithPrefix("tf-acc")
